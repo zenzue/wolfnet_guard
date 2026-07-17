@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 shopt -s extglob
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 INTERFACE="eno2"
 INTERVAL=15
 ARP_CAPTURE_SECONDS=3
@@ -53,6 +53,10 @@ LAST_DNS_STATUS="not checked"
 LAST_PROCESS_STATUS="not checked"
 LAST_EVENT="No alerts"
 START_TIME="$(date +%s)"
+SHUTDOWN_REQUESTED=0
+SHUTDOWN_REASON=""
+CLEANUP_DONE=0
+KEYBOARD_PID=""
 
 # Alert cooldown cache: key -> epoch
 # shellcheck disable=SC2034
@@ -132,9 +136,24 @@ required=(arp-scan ip awk sort comm grep sed cut date sha256sum ss ps flock time
 (( ENABLE_PASSIVE_ARP )) && required+=(tcpdump)
 missing=()
 for cmd in "${required[@]}"; do command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd"); done
+dependency_hint() {
+  if command -v pacman >/dev/null 2>&1; then
+    printf '%s\n' "Manjaro/Arch: sudo pacman -Syu arp-scan tcpdump bind iproute2 procps-ng util-linux libnotify"
+  elif command -v apt-get >/dev/null 2>&1; then
+    printf '%s\n' "Debian/Ubuntu: sudo apt update && sudo apt install arp-scan tcpdump dnsutils iproute2 procps util-linux libnotify-bin"
+  elif command -v dnf >/dev/null 2>&1; then
+    printf '%s\n' "Fedora/RHEL: sudo dnf install arp-scan tcpdump bind-utils iproute procps-ng util-linux libnotify"
+  elif command -v zypper >/dev/null 2>&1; then
+    printf '%s\n' "openSUSE: sudo zypper install arp-scan tcpdump bind-utils iproute2 procps util-linux libnotify-tools"
+  else
+    printf '%s\n' "Install: arp-scan, tcpdump, dig, iproute2, procps, util-linux, and optionally notify-send."
+    printf '%s\n' "Note: on Manjaro/Arch, dig is provided by the bind package."
+  fi
+}
+
 if ((${#missing[@]})); then
   printf 'Missing commands: %s\n' "${missing[*]}" >&2
-  echo "Debian/Ubuntu example: sudo apt install arp-scan tcpdump dnsutils iproute2 procps util-linux libnotify-bin" >&2
+  dependency_hint >&2
   exit 1
 fi
 
@@ -160,13 +179,69 @@ touch "$PREVIOUS_ARP" "$PREVIOUS_LISTENERS" "$EVENT_LOG" "$RUN_LOG"
 exec 9>"$STATE_DIR/monitor.lock"
 flock -n 9 || { echo "Another WolfNet Guard instance is already running." >&2; exit 1; }
 
-cleanup() {
-  tput cnorm 2>/dev/null || true
-  printf '%b\n' "${C_RESET}Monitor stopped. Logs: $LOG_DIR"
+request_shutdown() {
+  local reason="${1:-shutdown requested}"
+
+  if (( SHUTDOWN_REQUESTED == 0 )); then
+    SHUTDOWN_REQUESTED=1
+    SHUTDOWN_REASON="$reason"
+  fi
 }
-trap cleanup EXIT INT TERM
+
+cleanup() {
+  local exit_status="${1:-0}"
+
+  if (( CLEANUP_DONE != 0 )); then
+    return 0
+  fi
+  CLEANUP_DONE=1
+
+  if [[ -n "$KEYBOARD_PID" ]] && kill -0 "$KEYBOARD_PID" 2>/dev/null; then
+    kill "$KEYBOARD_PID" 2>/dev/null || true
+    wait "$KEYBOARD_PID" 2>/dev/null || true
+  fi
+
+  printf '\r\033[K'
+  tput cnorm 2>/dev/null || true
+  printf '%b' "$C_RESET"
+
+  if [[ -n "$SHUTDOWN_REASON" ]]; then
+    printf '%bWolfNet Guard stopped cleanly%b (%s).\n' "$C_GREEN" "$C_RESET" "$SHUTDOWN_REASON"
+  else
+    printf '%bWolfNet Guard stopped.%b\n' "$C_GREEN" "$C_RESET"
+  fi
+  printf 'Logs: %s\n' "$LOG_DIR"
+
+  return "$exit_status"
+}
+
+start_keyboard_watcher() {
+  # A dedicated reader makes q/Q work even while the main loop is scanning.
+  [[ -t 0 ]] || return 0
+
+  (
+    trap - INT TERM HUP USR1
+    local key
+    while IFS= read -rsn1 key; do
+      case "$key" in
+        q|Q)
+          kill -USR1 "$$" 2>/dev/null || true
+          break
+          ;;
+      esac
+    done
+  ) &
+  KEYBOARD_PID=$!
+}
+
+trap 'request_shutdown "q pressed"' USR1
+trap 'request_shutdown "Ctrl+C"' INT
+trap 'request_shutdown "SIGTERM"' TERM
+trap 'request_shutdown "terminal closed"' HUP
+trap 'cleanup $?' EXIT
 
 tput civis 2>/dev/null || true
+start_keyboard_watcher
 
 sanitize() {
   local value="${1//$'\n'/ }"
@@ -242,6 +317,7 @@ passive_arp_check() {
 
   local count
   count="$({ timeout "$ARP_CAPTURE_SECONDS" tcpdump -l -nn -e -i "$INTERFACE" "arp and not ether src $LOCAL_MAC" 2>/dev/null || true; } | grep -c 'ARP,' || true)"
+  (( SHUTDOWN_REQUESTED != 0 )) && return 0
   LAST_ARP_RATE="${count:-0}"
   if (( LAST_ARP_RATE >= ARP_FLOOD_THRESHOLD )); then
     alert WARNING "arp-flood-$INTERFACE" "Possible ARP flood" \
@@ -252,6 +328,7 @@ passive_arp_check() {
 run_arp_scan() {
   local tmp="$STATE_DIR/current_arp.tmp"
   if ! arp-scan --interface="$INTERFACE" --localnet --retry=1 --timeout=500 >"$RAW_ARP" 2>>"$RUN_LOG"; then
+    (( SHUTDOWN_REQUESTED != 0 )) && return 1
     alert WARNING "arp-scan-failed-$INTERFACE" "ARP scan failed" "arp-scan returned an error on $INTERFACE."
     return 1
   fi
@@ -415,6 +492,7 @@ check_dns_canaries() {
 
   local entry domain expected local_answers trusted_answers resolver reachable=0
   for entry in "${DNS_CANARIES[@]}"; do
+    (( SHUTDOWN_REQUESTED != 0 )) && return 0
     domain="${entry%%|*}"
     expected="${entry#*|}"
     local_answers="$(dig +time=2 +tries=1 +short A "$domain" 2>/dev/null | grep -E '^[0-9]+(\.[0-9]+){3}$' | sort -u || true)"
@@ -433,6 +511,7 @@ check_dns_canaries() {
 
     reachable=0
     for resolver in "${TRUSTED_DNS[@]}"; do
+      (( SHUTDOWN_REQUESTED != 0 )) && return 0
       trusted_answers="$(dig "@$resolver" +time=2 +tries=1 +short A "$domain" 2>/dev/null | grep -E '^[0-9]+(\.[0-9]+){3}$' | sort -u || true)"
       [[ -n "$trusted_answers" ]] || continue
       reachable=1
@@ -542,18 +621,36 @@ BANNER
   fi
 
   printf '%b━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%b\n' "$C_DIM" "$C_RESET"
-  printf 'Next cycle in %ss | Ctrl+C to stop | Events: %s\n' "$INTERVAL" "$EVENT_LOG"
+  printf '%bControls%b       q/Q: quit cleanly  |  Ctrl+C: quit  |  Events: %s\n' \
+    "$C_CYAN" "$C_RESET" "$EVENT_LOG"
+}
+
+wait_for_next_cycle() {
+  local remaining="$INTERVAL"
+
+  while (( remaining > 0 && SHUTDOWN_REQUESTED == 0 )); do
+    printf '\r%bNext scan in %2ss%b  |  Press q to quit\033[K' \
+      "$C_DIM" "$remaining" "$C_RESET"
+    sleep 1 || true
+    remaining=$((remaining - 1))
+  done
+
+  printf '\r\033[K'
 }
 
 main_loop() {
   refresh_network_identity
   normalize_listeners > "$PREVIOUS_LISTENERS" || true
 
-  while true; do
+  while (( SHUTDOWN_REQUESTED == 0 )); do
     refresh_network_identity
+    (( SHUTDOWN_REQUESTED != 0 )) && break
+
     passive_arp_check
+    (( SHUTDOWN_REQUESTED != 0 )) && break
 
     if run_arp_scan; then
+      (( SHUTDOWN_REQUESTED != 0 )) && break
       check_duplicate_ip_claims
       check_duplicate_mac_claims
       check_ip_mac_changes
@@ -561,13 +658,16 @@ main_loop() {
       check_gateway_mac
       check_dns_canaries
       check_netcat_and_listeners
+
+      (( SHUTDOWN_REQUESTED != 0 )) && break
       render_dashboard
       cp "$CURRENT_ARP" "$PREVIOUS_ARP"
     else
+      (( SHUTDOWN_REQUESTED != 0 )) && break
       render_dashboard
     fi
 
-    sleep "$INTERVAL"
+    wait_for_next_cycle
   done
 }
 
