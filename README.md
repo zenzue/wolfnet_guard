@@ -12,7 +12,7 @@
 **WolfNet Guard** is a defensive Linux LAN-monitoring utility that combines active ARP discovery, passive ARP-rate monitoring, gateway identity checks, DNS consistency checks, local Netcat-style process detection, socket monitoring, terminal alerts, desktop notifications, system logging, and persistent state tracking.
 
 **Author:** Aung Myat Thu  
-**Version:** 1.0.0  
+**Version:** 1.1.0  
 **Platform:** Linux  
 **Purpose:** Authorized monitoring of networks and systems you own or administer.
 
@@ -213,6 +213,13 @@ After system-wide installation, run it as:
 sudo wolfnet-guard --interface eno2
 ```
 
+If the downloaded script uses the versioned filename, you may keep it or rename it:
+
+```bash
+mv wolfnet_guard_v1.1.0.sh wolfnet_guard.sh
+chmod +x wolfnet_guard.sh
+```
+
 Validate the Bash syntax before the first run:
 
 ```bash
@@ -279,7 +286,48 @@ sudo ./wolfnet_guard.sh \
   --interval 10
 ```
 
-Press `Ctrl+C` to stop the monitor safely.
+Press `q` or `Q` to stop the monitor cleanly. You can also use `Ctrl+C`.
+
+The `q`/`Q` control is handled by a dedicated keyboard watcher, so it remains responsive while the main loop is scanning, capturing ARP traffic, or running DNS checks.
+
+---
+
+## Keyboard controls and clean shutdown
+
+WolfNet Guard 1.1.0 supports responsive keyboard-based shutdown:
+
+| Control | Result |
+|---|---|
+| `q` or `Q` | Requests a clean shutdown from the live dashboard |
+| `Ctrl+C` | Requests the same clean shutdown through `SIGINT` |
+| `SIGTERM` | Stops cleanly when terminated by a service manager or another process |
+| Terminal close | Handles `SIGHUP` and restores the terminal where possible |
+
+The keyboard watcher runs separately from the monitoring cycle. This allows `q` or `Q` to be recognized even while the main process is performing an ARP scan, passive capture, or DNS query.
+
+During shutdown, WolfNet Guard:
+
+1. Stops accepting new monitoring work.
+2. Terminates the keyboard-watcher process.
+3. Avoids reporting an interrupted scan as a false scan-failure alert.
+4. Restores the terminal cursor.
+5. Resets terminal formatting.
+6. Prints the shutdown reason and log-directory location.
+7. Runs cleanup only once.
+
+Example clean-shutdown messages:
+
+```text
+WolfNet Guard stopped cleanly (q pressed).
+Logs: /var/log/wolfnet-guard
+```
+
+```text
+WolfNet Guard stopped cleanly (Ctrl+C).
+Logs: /var/log/wolfnet-guard
+```
+
+> `q` and `Q` require an interactive terminal connected to standard input. When running non-interactively, use `SIGTERM`, `Ctrl+C` from the attached terminal, or your service manager's normal stop command.
 
 ---
 
@@ -363,7 +411,9 @@ Usage: sudo wolfnet_guard.sh [options]
 -h, --help                  Display help
 ```
 
-The scan cycle takes longer than the configured interval because the passive ARP capture, ARP scan, DNS requests, and process checks run before the final sleep.
+The scan cycle takes longer than the configured interval because passive ARP capture, ARP scanning, DNS requests, and process checks run before the countdown begins.
+
+The countdown updates once per second and displays `Press q to quit`. The dedicated keyboard watcher also allows `q` or `Q` to request shutdown during long-running checks rather than only during the countdown.
 
 ---
 
@@ -714,7 +764,7 @@ Each cycle follows this sequence:
 10. Inspect local processes and listening sockets.
 11. Render the live terminal dashboard.
 12. Save current state as the baseline for the next cycle.
-13. Sleep for the configured interval.
+13. Run a one-second countdown for the configured interval while continuing to accept `q`/`Q` shutdown input.
 
 The first cycle establishes several baselines. Device-change comparison begins after a previous scan exists.
 
@@ -941,11 +991,39 @@ sudo ./wolfnet_guard.sh \
   --log-dir /var/log/wolfnet-guard-eno2
 ```
 
+### Pressing `q` does not quit
+
+Confirm that WolfNet Guard is attached to an interactive terminal:
+
+```bash
+test -t 0 && echo "Interactive input available" || echo "No interactive input"
+```
+
+Run it directly rather than piping standard input:
+
+```bash
+sudo ./wolfnet_guard.sh --interface eno2
+```
+
+`q` may not work when the process is started with closed or redirected standard input, from some background-job configurations, or from a service without a terminal. Stop it using one of these methods:
+
+```bash
+sudo pkill -TERM -f wolfnet_guard.sh
+```
+
+```bash
+sudo kill -TERM PID
+```
+
+For an attached terminal, `Ctrl+C` remains available.
+
 ### The screen refresh behaves badly in a service or redirected terminal
 
-Version 1.0.0 is designed primarily for an interactive terminal. The dashboard calls `clear` and uses terminal-control sequences. Run it directly in a terminal, `tmux`, or `screen`.
+Version 1.1.0 is designed primarily for an interactive terminal. The dashboard calls `clear`, hides and restores the cursor, reads single-key input, and uses terminal-control sequences. Run it directly in a terminal, `tmux`, or `screen`.
 
-A dedicated non-interactive or systemd mode would require a small script change to disable dashboard rendering.
+When standard input is not a terminal, the keyboard watcher is not started. In that mode, `q`/`Q` is unavailable, but `SIGTERM`, `SIGINT`, and `SIGHUP` still use the clean shutdown path.
+
+A dedicated non-interactive or systemd mode would require a small script change to disable dashboard rendering and optionally redirect output entirely to journald or log files.
 
 ---
 
@@ -1018,6 +1096,26 @@ Protect and hash the archive according to your normal evidence-handling procedur
 
 ---
 
+## Version history
+
+### 1.1.0
+
+- Added clean `q`/`Q` shutdown from the live interface.
+- Added a dedicated keyboard watcher so quit input remains responsive during monitoring work.
+- Unified `q`, `Ctrl+C`, `SIGTERM`, and terminal-close handling.
+- Added single-run cleanup protection.
+- Restores cursor visibility and terminal formatting on shutdown.
+- Stops the keyboard watcher during cleanup.
+- Prevents interrupted scans and checks from creating false failure alerts.
+- Added a visible one-second next-scan countdown.
+- Improved distribution-specific dependency guidance, including the Arch Linux and Manjaro `bind` package for `dig`.
+
+### 1.0.0
+
+- Initial defensive LAN-monitoring release.
+
+---
+
 ## Suggested future improvements
 
 - IPv6 NDP and Router Advertisement monitoring
@@ -1044,6 +1142,9 @@ Protect and hash the archive according to your normal evidence-handling procedur
 wolfnet-guard/
 ├── wolfnet_guard.sh
 └── README.md
+
+# Release download filename:
+wolfnet_guard_v1.1.0.sh
 ```
 
 ---
